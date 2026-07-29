@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Daily Riftbound price snapshot from the TCGGO API.
+"""Daily Riftbound price snapshot via the RapidAPI "riftbound-prices-api" listing.
 
 Writes prices.json keyed by "<SET>-<NUMBER>" -- the API's card_number with the
 "/<set total>" suffix stripped. That key is exactly what the app can compose
 from its own CardSeed fields (set + number), so no mapping table is needed for
 the four base sets.
 
-Budget: the API key allows 100 calls/day. A full sweep is ~16-21 calls.
+TCGGO_API_KEY holds the RapidAPI key (the secret name is kept for continuity).
+
+Budget: the free tier allows 100 calls/day. A full sweep is ~16-21 calls.
 CALL_CEILING is a hard stop so a pagination bug can never drain the day's quota.
 
 Usage:
@@ -26,20 +28,20 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-# --- CONFIRM THESE TWO AGAINST https://www.tcggo.com/api-docs/v1/ ----------
-# The docs are 403 to automated fetches, so these are the conventional shapes
-# rather than values read off the page. --probe tells you if they are wrong.
-BASE_URL = os.environ.get("TCGGO_BASE_URL", "https://api.tcggo.com/v1")
-AUTH_STYLE = os.environ.get("TCGGO_AUTH_STYLE", "bearer")  # "bearer" | "query"
-# --------------------------------------------------------------------------
+# The API is reached through the RapidAPI gateway, not tcggo.com directly.
+# The listing is Riftbound-specific, so there is no /{game} path segment:
+# it is /cards, not /riftbound/cards.
+RAPIDAPI_HOST = os.environ.get(
+    "RAPIDAPI_HOST", "riftbound-prices-api.p.rapidapi.com")
+BASE_URL = f"https://{RAPIDAPI_HOST}"
 
-GAME = "riftbound"
 PER_PAGE = 100          # only honoured when episode_id is set; 20 otherwise
 CALL_CEILING = 80       # of the 100/day, leaving headroom for retries + manual
 TIMEOUT = 30
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
 _calls = 0
+_remaining = None       # RapidAPI's own quota counter, read off each response
 
 
 class BudgetExceeded(RuntimeError):
@@ -48,20 +50,17 @@ class BudgetExceeded(RuntimeError):
 
 def api(path: str, **params) -> dict:
     """One GET against the API. Counts against the daily budget."""
-    global _calls
+    global _calls, _remaining
     if _calls >= CALL_CEILING:
         raise BudgetExceeded(f"hit the {CALL_CEILING}-call ceiling")
 
-    key = os.environ["TCGGO_API_KEY"]
-    if AUTH_STYLE == "query":
-        params["api_key"] = key
-        headers = {}
-    else:
-        headers = {"Authorization": f"Bearer {key}"}
-    headers["Accept"] = "application/json"
-    headers["User-Agent"] = "riftbound-prices/1.0 (+github.com/NoWaddleAround)"
+    headers = {
+        "x-rapidapi-key": os.environ["TCGGO_API_KEY"],
+        "x-rapidapi-host": RAPIDAPI_HOST,
+        "Accept": "application/json",
+    }
 
-    url = f"{BASE_URL}/{GAME}/{path}"
+    url = f"{BASE_URL}/{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
 
@@ -71,13 +70,22 @@ def api(path: str, **params) -> dict:
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                left = resp.headers.get("x-ratelimit-requests-remaining")
+                if left is not None:
+                    _remaining = left
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code in RETRY_STATUS and attempt == 0:
                 time.sleep(5)
                 continue
             body = e.read()[:400].decode("utf-8", "replace")
-            raise SystemExit(f"HTTP {e.code} on {url}\n{body}") from e
+            hint = ""
+            if e.code in (401, 403):
+                hint = ("\nhint: check the TCGGO_API_KEY secret holds your "
+                        "RapidAPI key, and that you are subscribed to the listing.")
+            elif e.code == 429:
+                hint = "\nhint: daily quota exhausted -- it resets on RapidAPI's clock."
+            raise SystemExit(f"HTTP {e.code} on {url}\n{body}{hint}") from e
     raise SystemExit(f"gave up on {url}")
 
 
@@ -161,7 +169,8 @@ def main() -> None:
     if args.probe:
         payload = api("cards", per_page=1)
         print(json.dumps(payload, indent=2)[:2000])
-        print(f"\n-- calls used: {_calls}", file=sys.stderr)
+        print(f"\n-- calls used: {_calls}, quota left today: {_remaining}",
+              file=sys.stderr)
         return
 
     snapshot = sweep()
@@ -171,7 +180,7 @@ def main() -> None:
 
     size = os.path.getsize(args.out)
     print(f"wrote {args.out}: {snapshot['count']} cards, {size/1024:.1f} KB, "
-          f"{_calls} calls used", file=sys.stderr)
+          f"{_calls} calls used, quota left today: {_remaining}", file=sys.stderr)
 
     # A sweep that collapses to almost nothing means the API changed shape.
     # Fail loudly rather than publishing an empty snapshot over a good one.
