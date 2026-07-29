@@ -219,12 +219,25 @@ def build(singles: list, guide: dict, cards: list, links: dict) -> tuple[dict, d
     return out, dict(stats)
 
 
+SOURCE = "cardmarket-data-tables"
+
+
 def carry_forward(cards: dict, previous: dict, today: str) -> tuple[int, int]:
     """Keep the last known price for a card that has dropped out of Cardmarket's catalogue.
 
     Rare now that the source is the catalogue itself, but a delisted product would otherwise
     read as 0.00€ in the app and drop a collection total by its full value overnight.
+
+    🪤 **Never carry across a change of source.** The previous snapshot may have been built from
+    TCGGO, whose figures are `lowest_near_mint` — a different measure entirely. Importing those
+    under a label that reads "Lowest on CM regarding any language" would put a wrong number
+    behind a confident sentence, which is worse than showing nothing for those cards.
     """
+    if previous.get("source") != SOURCE:
+        if previous:
+            print(f"previous snapshot came from {previous.get('source', 'an older build')!r} — "
+                  "not carrying its prices across the source change", file=sys.stderr)
+        return 0, 0
     carried = expired = 0
     cutoff = (datetime.now(timezone.utc) - timedelta(days=MAX_CARRY_DAYS)).strftime("%Y-%m-%d")
     for key, prev in (previous.get("cards") or {}).items():
@@ -293,7 +306,7 @@ def main() -> None:
 
     snapshot = {
         "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source": "cardmarket-data-tables",
+        "source": SOURCE,
         "source_created_at": guide_created,
         "currency": "EUR",
         "count": len(built),
