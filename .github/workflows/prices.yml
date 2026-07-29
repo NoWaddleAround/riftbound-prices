@@ -2,26 +2,80 @@ name: Daily price snapshot
 
 on:
   schedule:
-    # 04:17 UTC. Deliberately not on the hour -- GitHub's scheduler is
-    # congested at :00 and delays jobs by up to 20 minutes there.
-    - cron: "17 4 * * *"
-  workflow_dispatch:        # lets you run it by hand from the Actions tab
+    # Target: 09:00 Europe/Berlin, every day, year-round.
+    #
+    # ⚠️ GitHub cron is UTC and does NOT follow daylight saving, so no single entry hits 09:00
+    # Berlin all year. Both of these fire every day and the `gate` job below decides which one is
+    # the real 09:00 — the other exits before spending a single API call.
+    - cron: "0 7 * * *"   # 09:00 Berlin while CEST (UTC+2), roughly late Mar - late Oct
+    - cron: "0 8 * * *"   # 09:00 Berlin while CET  (UTC+1), roughly late Oct - late Mar
+  workflow_dispatch:      # manual run: always proceeds, whatever the clock says
 
 concurrency:
   group: prices
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+env:
+  PUBLISHED_URL: https://nowaddlearound.github.io/riftbound-prices/prices.json
 
 jobs:
+  # Costs seconds of Actions time and zero API calls. Runs before anything touches the key.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.check.outputs.go }}
+    steps:
+      - id: check
+        name: Is this the 09:00 Berlin run?
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run — proceeding regardless of the clock."
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # %-H drops the leading zero: "08" is octal in shell arithmetic and would error.
+          hour=$(TZ=Europe/Berlin date +%-H)
+          today=$(TZ=Europe/Berlin date +%F)
+
+          # The published snapshot's own date. A plain GET of our Pages URL — NOT an API call,
+          # so this costs nothing against the 100/day budget.
+          published=$(curl -fsSL --max-time 20 "$PUBLISHED_URL" 2>/dev/null \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("generated_at","")[:10])' \
+            2>/dev/null || echo "")
+
+          echo "Berlin: $today ${hour}:00 · last published: ${published:-none}"
+
+          if [ "$hour" -lt 9 ]; then
+            # The other DST cron. In winter the 07:00 UTC entry lands at 08:00 Berlin.
+            echo "Before 09:00 Berlin — this is the off-season cron. Skipping."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          elif [ "$published" = "$today" ]; then
+            # 🪤 This is what stops BOTH crons sweeping on the same day. Checking the clock alone
+            # is not enough: a delayed run can arrive an hour late and look like the other cron.
+            echo "Already published today — nothing to do."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            # Deliberately >= 09:00 rather than == 09:00. GitHub queues scheduled jobs and can
+            # start them 10-30 minutes late (occasionally more); an exact-hour test would drop
+            # the day's sweep entirely whenever that happened. Late is fine, missed is not.
+            echo "Proceeding."
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
   sweep:
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -31,8 +85,7 @@ jobs:
 
       - name: Sweep the API
         env:
-          # Holds the RapidAPI key. Secret name kept as-is so you don't
-          # have to re-add it.
+          # Holds the RapidAPI key. Secret name kept as-is so you don't have to re-add it.
           TCGGO_API_KEY: ${{ secrets.TCGGO_API_KEY }}
           # Only needed if the RapidAPI listing is ever renamed:
           # RAPIDAPI_HOST: riftbound-prices-api.p.rapidapi.com
