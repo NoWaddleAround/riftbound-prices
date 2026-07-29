@@ -2,70 +2,34 @@ name: Daily price snapshot
 
 on:
   schedule:
-    # Target: 09:00 Europe/Berlin, every day, year-round.
-
-    - cron: "0 7 * * *"   # 09:00 Berlin while CEST (UTC+2), roughly late Mar - late Oct
-    - cron: "0 8 * * *"   # 09:00 Berlin while CET  (UTC+1), roughly late Oct - late Mar
-  workflow_dispatch:      # manual run: always proceeds, whatever the clock says
+    # Cardmarket regenerates price_guide_22.json around 02:45 Europe/Berlin (observed 02:42 and
+    # 02:48 on separate days). These two entries are 03:00 Berlin either side of DST, ~15 minutes
+    # after the drop.
+    #
+    # 🪤 There is deliberately NO gate job checking the clock. sweep.py compares the file's own
+    # `createdAt` against the published snapshot's `source_created_at` and exits 100 when nothing
+    # has changed — so whichever cron lands before the nightly drop simply no-ops, and a drop that
+    # runs late is still picked up by the next day's first cron. Guessing a schedule was the
+    # fragile half of the old design; asking the data is not.
+    - cron: "0 1 * * *"   # 03:00 Berlin while CEST (UTC+2)
+    - cron: "0 2 * * *"   # 03:00 Berlin while CET  (UTC+1)
+  workflow_dispatch:
 
 concurrency:
   group: prices
   cancel-in-progress: false
 
-env:
-  PUBLISHED_URL: https://nowaddlearound.github.io/riftbound-prices/prices.json
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  gate:
-    runs-on: ubuntu-latest
-    outputs:
-      go: ${{ steps.check.outputs.go }}
-    steps:
-      - id: check
-        name: Is this the 09:00 Berlin run?
-        run: |
-          set -euo pipefail
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual run — proceeding regardless of the clock."
-            echo "go=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # %-H drops the leading zero: "08" is octal in shell arithmetic and would error.
-          hour=$(TZ=Europe/Berlin date +%-H)
-          today=$(TZ=Europe/Berlin date +%F)
-
-          # The published snapshot's own date. A plain GET of our Pages URL — NOT an API call,
-          # so this costs nothing against the 100/day budget.
-          published=$(curl -fsSL --max-time 20 "$PUBLISHED_URL" 2>/dev/null \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("generated_at","")[:10])' \
-            2>/dev/null || echo "")
-
-          echo "Berlin: $today ${hour}:00 · last published: ${published:-none}"
-
-          if [ "$hour" -lt 9 ]; then
-            echo "Before 09:00 Berlin — this is the off-season cron. Skipping."
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          elif [ "$published" = "$today" ]; then
-            echo "Already published today — nothing to do."
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Proceeding."
-            echo "go=true" >> "$GITHUB_OUTPUT"
-          fi
-
   sweep:
-    needs: gate
-    if: needs.gate.outputs.go == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -73,16 +37,32 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Sweep the API
-        env:
-          TCGGO_API_KEY: ${{ secrets.TCGGO_API_KEY }}
-        run: python sweep.py --out out/prices.json
+      # No API key and no quota: the three Cardmarket Data Tables exports are public static
+      # files. The RapidAPI subscription this pipeline used to depend on is no longer involved.
+      - name: Build the snapshot
+        id: sweep
+        run: |
+          set +e
+          python sweep.py --assets . --out out/prices.json
+          code=$?
+          set -e
+          if [ $code -eq 0 ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          elif [ $code -eq 100 ]; then
+            echo "Cardmarket data unchanged — leaving the live snapshot as it is."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            exit $code
+          fi
 
-      - uses: actions/configure-pages@v5
+      - if: steps.sweep.outputs.published == 'true'
+        uses: actions/configure-pages@v5
 
-      - uses: actions/upload-pages-artifact@v3
+      - if: steps.sweep.outputs.published == 'true'
+        uses: actions/upload-pages-artifact@v3
         with:
           path: out
 
       - id: deploy
+        if: steps.sweep.outputs.published == 'true'
         uses: actions/deploy-pages@v4
