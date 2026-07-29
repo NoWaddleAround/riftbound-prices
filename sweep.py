@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # The API is reached through the RapidAPI gateway, not tcggo.com directly.
 # The listing is Riftbound-specific, so there is no /{game} path segment:
@@ -39,6 +39,11 @@ PER_PAGE = 100          # the docs promise per_page but state no maximum;
                         # the run log reports what the API actually honoured
 CALL_CEILING = 80       # of the 100/day, leaving headroom for retries + manual
 MIN_CARDS = 200         # refuse to publish a snapshot smaller than this
+MAX_CARRY_DAYS = 90     # how long a sold-out card keeps its last known price
+
+# Where the previous snapshot is read from for carry-forward. Not an API call.
+PUBLISHED_URL = os.environ.get(
+    "PUBLISHED_URL", "https://nowaddlearound.github.io/riftbound-prices/prices.json")
 TIMEOUT = 30
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
@@ -106,18 +111,94 @@ def price_key(card_number) -> str | None:
     return key
 
 
+def _positive(cm: dict, field: str) -> float | None:
+    """A Cardmarket figure, or None when it is missing, null, non-numeric or <= 0."""
+    v = cm.get(field)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v) if v > 0 else None
+
+
 def extract(card: dict) -> dict | None:
-    """Pull the Cardmarket block down to the five fields the app renders."""
+    """Pull the Cardmarket block down to what the app renders.
+
+    🪤 **`low` is a best-available figure, not strictly the lowest listing.** When every copy
+    sells out, Cardmarket has no "lowest near mint" to report -- but the 7- and 30-day averages
+    survive, because they describe trades that already happened. Reading only `lowest_near_mint`
+    would price a sold-out chase card at nothing the morning after it sold, which is the one
+    number it certainly is not worth. `src` records when a fallback was used.
+    """
     cm = (card.get("prices") or {}).get("cardmarket")
     if not cm:
         return None
-    low = cm.get("lowest_near_mint")
-    d7 = cm.get("7d_average")
-    d30 = cm.get("30d_average")
-    if low is None and d7 is None and d30 is None:
+
+    low = _positive(cm, "lowest_near_mint")
+    d7 = _positive(cm, "7d_average")
+    d30 = _positive(cm, "30d_average")
+
+    best = low or d7 or d30
+    if best is None:
         return None
-    out = {"low": low, "d7": d7, "d30": d30, "n": cm.get("available_items")}
-    return {k: v for k, v in out.items() if v is not None}
+
+    out: dict = {"low": best}
+    if low is None:
+        out["src"] = "d7" if d7 else "d30"
+    if d7 is not None:
+        out["d7"] = d7
+    if d30 is not None:
+        out["d30"] = d30
+    n = cm.get("available_items")
+    if isinstance(n, int):
+        out["n"] = n
+    return out
+
+
+def previous_snapshot() -> dict:
+    """The last published snapshot, for carry-forward.
+
+    ⚠️ This is a plain GET of our own Pages URL -- **it is not an API call and costs nothing
+    against the 100/day budget.** Deliberately not routed through api(), which counts.
+
+    Returns {} on the very first run, or if Pages is briefly unavailable. That degrades to the
+    old behaviour (no carry-forward) rather than failing the sweep.
+    """
+    try:
+        req = urllib.request.Request(
+            PUBLISHED_URL, headers={"User-Agent": "riftbound-prices-sweep"})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("cards") or {}
+    except Exception as e:  # noqa: BLE001 -- any failure means "no previous snapshot"
+        print(f"no previous snapshot to carry forward ({e})", file=sys.stderr)
+        return {}
+
+
+def carry_forward(cards: dict, previous: dict, today: str) -> tuple[int, int]:
+    """Reinstate cards that had a price yesterday and have none today.
+
+    A card falls out of the sweep when nothing is listed AND no average survives -- the exact
+    situation after the last copy of a chase card sells. Emitting nothing for it makes the app
+    render 0.00€, so a collection total would drop by the card's full value overnight.
+
+    Entries are stamped with `since`, the date the price stopped being live, and dropped once
+    that is older than MAX_CARRY_DAYS: a price nobody has confirmed in three months has stopped
+    being information.
+    """
+    carried = expired = 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=MAX_CARRY_DAYS)).strftime("%Y-%m-%d")
+    for key, prev in previous.items():
+        if key in cards:
+            continue
+        value = prev.get("low")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            continue
+        # Keep the ORIGINAL since-date across repeated carries, or the age never advances.
+        since = prev.get("since") if prev.get("src") == "carried" else today
+        if since < cutoff:
+            expired += 1
+            continue
+        cards[key] = {"low": float(value), "src": "carried", "since": since}
+        carried += 1
+    return carried, expired
 
 
 def sweep() -> dict:
@@ -176,11 +257,29 @@ def sweep() -> dict:
     if collisions:
         print(f"ambiguous duplicate numbers skipped: {collisions}", file=sys.stderr)
 
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    live = len(cards)
+
+    # Anything priced yesterday and missing today keeps its last known figure. Without this a
+    # sold-out card reads 0.00€ in the app and a collection total drops by its full value.
+    carried, expired = carry_forward(cards, previous_snapshot(), today)
+    if carried:
+        print(f"carried forward (nothing listed today): {carried}", file=sys.stderr)
+    if expired:
+        print(f"dropped, unlisted over {MAX_CARRY_DAYS} days: {expired}", file=sys.stderr)
+
+    fallbacks = sum(1 for v in cards.values() if v.get("src") in ("d7", "d30"))
+    if fallbacks:
+        print(f"priced from an average, nothing listed: {fallbacks}", file=sys.stderr)
+
     return {
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "currency": "EUR",
         "source": "tcggo.com",
         "count": len(cards),
+        "live": live,
+        "carried": carried,
         "cards": cards,
     }
 
