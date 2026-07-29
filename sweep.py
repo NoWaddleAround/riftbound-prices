@@ -155,8 +155,8 @@ def main() -> None:
     ap.add_argument("-o", "--out", default="out/prices.json")
     args = ap.parse_args()
 
-    if "TCGGO_API_KEY" not in os.environ:
-        raise SystemExit("TCGGO_API_KEY is not set")
+    if not os.environ.get("TCGGO_API_KEY"):
+        raise SystemExit("TCGGO_API_KEY is missing or empty -- check the repo secret")
 
     if args.probe:
         payload = api("cards", per_page=1)
