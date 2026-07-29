@@ -3,10 +3,7 @@ name: Daily price snapshot
 on:
   schedule:
     # Target: 09:00 Europe/Berlin, every day, year-round.
-    #
-    # ⚠️ GitHub cron is UTC and does NOT follow daylight saving, so no single entry hits 09:00
-    # Berlin all year. Both of these fire every day and the `gate` job below decides which one is
-    # the real 09:00 — the other exits before spending a single API call.
+
     - cron: "0 7 * * *"   # 09:00 Berlin while CEST (UTC+2), roughly late Mar - late Oct
     - cron: "0 8 * * *"   # 09:00 Berlin while CET  (UTC+1), roughly late Oct - late Mar
   workflow_dispatch:      # manual run: always proceeds, whatever the clock says
