@@ -31,10 +31,11 @@ jobs:
 
       - name: Sweep the API
         env:
+          # Holds the RapidAPI key. Secret name kept as-is so you don't
+          # have to re-add it.
           TCGGO_API_KEY: ${{ secrets.TCGGO_API_KEY }}
-          # Uncomment and set if --probe showed the defaults were wrong:
-          # TCGGO_BASE_URL: https://api.tcggo.com/v1
-          # TCGGO_AUTH_STYLE: bearer
+          # Only needed if the RapidAPI listing is ever renamed:
+          # RAPIDAPI_HOST: riftbound-prices-api.p.rapidapi.com
         run: python sweep.py --out out/prices.json
 
       - uses: actions/configure-pages@v5
