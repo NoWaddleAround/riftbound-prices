@@ -96,19 +96,40 @@ def api(path: str, **params) -> dict:
     raise SystemExit(f"gave up on {url}")
 
 
-def price_key(card_number) -> str | None:
-    """'SFD-239/221' -> 'SFD-239'.  'SFD-239*/221' -> 'SFD-239*'.
+# The app's own code for each promo wave, by the API's episode name.
+#
+# 🪤 "Origins: Promos" reports code "OGN" -- the BASE set's code. Keying its 96 promos with that
+# would collide with every ordinary Origins card and silently poison real prices. The app calls
+# that wave OGNX (handoff §6), and this map is the only place that correction lives.
+#
+# An episode not listed here falls back to its own `code`. That is why Project K Promos keys as
+# PROK: the app has no such set, so those 5 cards simply never match -- honest, and harmless.
+PROMO_SET_CODE = {
+    "Origins: Promos": "OGNX",
+    "Spiritforged: Promos": "SFDX",
+    "Unleashed: Promos": "UNLX",
+    "Vendetta: Promos": "VENX",
+}
 
-    card_number arrives as an int for some cards (a bare number with no set
-    prefix), so coerce before splitting. A key with no '-' cannot match the
-    app's "<set>-<number>" form, so it is dropped rather than stored unjoinable.
+
+def price_key(card_number, episode_code: str | None = None) -> str | None:
+    """'SFD-239/221' -> 'SFD-239'.  'SFD-239*/221' -> 'SFD-239*'.  '007' -> 'SFDX-007'.
+
+    card_number arrives as an int for some cards, so coerce before splitting.
+
+    🪤 **Promo episodes number their cards WITHOUT a set prefix** -- bare "007", "125", "FND251".
+    Nothing in the number itself says which wave it belongs to, so the episode's code has to
+    supply it. Before this, every one of those returned None and ~170 promos were discarded as
+    unkeyable, which read in the app as "the API has no promos" rather than "we threw them away".
     """
     if card_number is None:
         return None
     key = str(card_number).split("/", 1)[0].strip()
-    if not key or "-" not in key:
+    if not key:
         return None
-    return key
+    if "-" in key:
+        return key
+    return f"{episode_code}-{key}" if episode_code else None
 
 
 def _positive(cm: dict, field: str) -> float | None:
@@ -156,7 +177,7 @@ def extract(card: dict) -> dict | None:
 def previous_snapshot() -> dict:
     """The last published snapshot, for carry-forward.
 
-    This is a plain GET of our own Pages URL -- **it is not an API call and costs nothing
+    ⚠️ This is a plain GET of our own Pages URL -- **it is not an API call and costs nothing
     against the 100/day budget.** Deliberately not routed through api(), which counts.
 
     Returns {} on the very first run, or if Pages is briefly unavailable. That degrades to the
@@ -220,6 +241,8 @@ def sweep() -> dict:
 
     for ep in eps:
         ep_id, ep_name = ep.get("id"), ep.get("name", "?")
+        # What a bare, unprefixed number in this episode should be keyed as.
+        ep_code = PROMO_SET_CODE.get(ep_name) or ep.get("code")
         page, pages = 1, 1
         got = seen = 0
         dupes = 0
@@ -233,9 +256,11 @@ def sweep() -> dict:
                 honoured_per_page = paging.get("per_page")
             for card in payload.get("data", []):
                 seen += 1
-                if len(samples) < 3:
+                # Eight, not three: the promo waves number their cards in ways that only become
+                # readable across a handful of examples (sequential? base-set numbers? letters?).
+                if len(samples) < 8:
                     samples.append(str(card.get("card_number")))
-                key = price_key(card.get("card_number"))
+                key = price_key(card.get("card_number"), ep_code)
                 if not key:
                     unkeyed += 1
                     continue
@@ -262,6 +287,7 @@ def sweep() -> dict:
             "name": ep_name,
             "slug": ep.get("slug"),
             "code": ep.get("code"),
+            "key_prefix": ep_code,
             "released_at": ep.get("released_at"),
             "returned": seen,
             "priced": got,
