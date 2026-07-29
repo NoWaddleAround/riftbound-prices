@@ -1,0 +1,47 @@
+name: Daily price snapshot
+
+on:
+  schedule:
+    # 04:17 UTC. Deliberately not on the hour -- GitHub's scheduler is
+    # congested at :00 and delays jobs by up to 20 minutes there.
+    - cron: "17 4 * * *"
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+concurrency:
+  group: prices
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sweep the API
+        env:
+          TCGGO_API_KEY: ${{ secrets.TCGGO_API_KEY }}
+          # Uncomment and set if --probe showed the defaults were wrong:
+          # TCGGO_BASE_URL: https://api.tcggo.com/v1
+          # TCGGO_AUTH_STYLE: bearer
+        run: python sweep.py --out out/prices.json
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
