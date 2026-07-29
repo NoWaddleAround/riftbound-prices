@@ -156,7 +156,7 @@ def extract(card: dict) -> dict | None:
 def previous_snapshot() -> dict:
     """The last published snapshot, for carry-forward.
 
-    ⚠️ This is a plain GET of our own Pages URL -- **it is not an API call and costs nothing
+    This is a plain GET of our own Pages URL -- **it is not an API call and costs nothing
     against the 100/day budget.** Deliberately not routed through api(), which counts.
 
     Returns {} on the very first run, or if Pages is briefly unavailable. That degrades to the
@@ -213,11 +213,17 @@ def sweep() -> dict:
     unkeyed = 0
     unpriced = 0
     honoured_per_page = None
+    # Per-episode census, published INSIDE the snapshot rather than only logged. The log scrolls
+    # away and needs someone to copy it; this is fetchable from the Pages URL forever, and it is
+    # what answers "does the API even carry this set / these promos".
+    episodes: list[dict] = []
 
     for ep in eps:
         ep_id, ep_name = ep.get("id"), ep.get("name", "?")
         page, pages = 1, 1
         got = seen = 0
+        dupes = 0
+        samples: list[str] = []
         while page <= pages:
             payload = api("cards", episode_id=ep_id, per_page=PER_PAGE, page=page)
             paging = payload.get("paging") or {}
@@ -227,6 +233,8 @@ def sweep() -> dict:
                 honoured_per_page = paging.get("per_page")
             for card in payload.get("data", []):
                 seen += 1
+                if len(samples) < 3:
+                    samples.append(str(card.get("card_number")))
                 key = price_key(card.get("card_number"))
                 if not key:
                     unkeyed += 1
@@ -236,17 +244,33 @@ def sweep() -> dict:
                     unpriced += 1
                     continue
                 if key in cards:
-                    # Same printed number in two episodes (promos reprint their
-                    # base set's number). Keep the first and count it -- the app
-                    # refuses to guess for these, same rule as convertCollectionToPromos.
+                    # Same printed number in two episodes: promos reprint their base set's
+                    # number, so a Nexus-Night Poro and the ordinary one are both "OGN-210".
+                    # Keeping the first is the same refusal-to-guess as convertCollectionToPromos.
+                    # 🪤 A high `dupes` on an episode is the signature of a PROMO WAVE -- that is
+                    # the number to read when deciding whether promo pricing is reachable at all.
                     collisions += 1
+                    dupes += 1
                     continue
                 cards[key] = p
                 got += 1
             pages = paging.get("total", 1) or 1
             page += 1
+
+        episodes.append({
+            "id": ep_id,
+            "name": ep_name,
+            "slug": ep.get("slug"),
+            "code": ep.get("code"),
+            "released_at": ep.get("released_at"),
+            "returned": seen,
+            "priced": got,
+            "duplicate_numbers": dupes,
+            "sample_numbers": samples,
+        })
         print(f"  {ep_name}: {got} priced of {seen} returned "
-              f"({pages} page{'s' if pages != 1 else ''})", file=sys.stderr)
+              f"({pages} page{'s' if pages != 1 else ''}"
+              f"{f', {dupes} duplicate numbers' if dupes else ''})", file=sys.stderr)
 
     print(f"per_page honoured by the API: {honoured_per_page} "
           f"(requested {PER_PAGE})", file=sys.stderr)
@@ -280,6 +304,7 @@ def sweep() -> dict:
         "count": len(cards),
         "live": live,
         "carried": carried,
+        "episodes": episodes,
         "cards": cards,
     }
 
