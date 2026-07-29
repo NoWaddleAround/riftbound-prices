@@ -35,8 +35,10 @@ RAPIDAPI_HOST = os.environ.get(
     "RAPIDAPI_HOST", "riftbound-prices-api.p.rapidapi.com")
 BASE_URL = f"https://{RAPIDAPI_HOST}"
 
-PER_PAGE = 100          # only honoured when episode_id is set; 20 otherwise
+PER_PAGE = 100          # the docs promise per_page but state no maximum;
+                        # the run log reports what the API actually honoured
 CALL_CEILING = 80       # of the 100/day, leaving headroom for retries + manual
+MIN_CARDS = 200         # refuse to publish a snapshot smaller than this
 TIMEOUT = 30
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
@@ -89,11 +91,19 @@ def api(path: str, **params) -> dict:
     raise SystemExit(f"gave up on {url}")
 
 
-def price_key(card_number: str | None) -> str | None:
-    """'SFD-239/221' -> 'SFD-239'.  'SFD-239*/221' -> 'SFD-239*'."""
-    if not card_number:
+def price_key(card_number) -> str | None:
+    """'SFD-239/221' -> 'SFD-239'.  'SFD-239*/221' -> 'SFD-239*'.
+
+    card_number arrives as an int for some cards (a bare number with no set
+    prefix), so coerce before splitting. A key with no '-' cannot match the
+    app's "<set>-<number>" form, so it is dropped rather than stored unjoinable.
+    """
+    if card_number is None:
         return None
-    return card_number.split("/", 1)[0].strip() or None
+    key = str(card_number).split("/", 1)[0].strip()
+    if not key or "-" not in key:
+        return None
+    return key
 
 
 def extract(card: dict) -> dict | None:
@@ -111,26 +121,38 @@ def extract(card: dict) -> dict | None:
 
 
 def sweep() -> dict:
-    eps = api("episodes", per_page=PER_PAGE).get("data", [])
+    # /episodes documents only search + page, so don't send per_page here.
+    eps = api("episodes").get("data", [])
     if not eps:
-        raise SystemExit("no episodes returned -- check BASE_URL and the game slug")
+        raise SystemExit("no episodes returned -- check the host and the key")
     print(f"episodes: {len(eps)}", file=sys.stderr)
 
     cards: dict[str, dict] = {}
     collisions = 0
+    unkeyed = 0
+    unpriced = 0
+    honoured_per_page = None
 
     for ep in eps:
         ep_id, ep_name = ep.get("id"), ep.get("name", "?")
-        page, total = 1, 1
-        got = 0
-        while page <= total:
+        page, pages = 1, 1
+        got = seen = 0
+        while page <= pages:
             payload = api("cards", episode_id=ep_id, per_page=PER_PAGE, page=page)
+            paging = payload.get("paging") or {}
+            # The docs promise per_page but not a maximum. Record what the API
+            # actually gave us so the log says whether PER_PAGE=100 took effect.
+            if honoured_per_page is None:
+                honoured_per_page = paging.get("per_page")
             for card in payload.get("data", []):
+                seen += 1
                 key = price_key(card.get("card_number"))
                 if not key:
+                    unkeyed += 1
                     continue
                 p = extract(card)
                 if p is None:
+                    unpriced += 1
                     continue
                 if key in cards:
                     # Same printed number in two episodes (promos reprint their
@@ -140,10 +162,17 @@ def sweep() -> dict:
                     continue
                 cards[key] = p
                 got += 1
-            total = (payload.get("paging") or {}).get("total", 1) or 1
+            pages = paging.get("total", 1) or 1
             page += 1
-        print(f"  {ep_name}: {got} priced", file=sys.stderr)
+        print(f"  {ep_name}: {got} priced of {seen} returned "
+              f"({pages} page{'s' if pages != 1 else ''})", file=sys.stderr)
 
+    print(f"per_page honoured by the API: {honoured_per_page} "
+          f"(requested {PER_PAGE})", file=sys.stderr)
+    if unkeyed:
+        print(f"no set-prefixed card_number, skipped: {unkeyed}", file=sys.stderr)
+    if unpriced:
+        print(f"no cardmarket price block, skipped: {unpriced}", file=sys.stderr)
     if collisions:
         print(f"ambiguous duplicate numbers skipped: {collisions}", file=sys.stderr)
 
@@ -184,8 +213,11 @@ def main() -> None:
 
     # A sweep that collapses to almost nothing means the API changed shape.
     # Fail loudly rather than publishing an empty snapshot over a good one.
-    if snapshot["count"] < 500:
-        raise SystemExit(f"only {snapshot['count']} priced cards -- refusing to publish")
+    # Deliberately low until a first full run establishes the real total --
+    # raise it to roughly 80% of that number once you know it.
+    if snapshot["count"] < MIN_CARDS:
+        raise SystemExit(f"only {snapshot['count']} priced cards "
+                         f"(floor is {MIN_CARDS}) -- refusing to publish")
 
 
 if __name__ == "__main__":
