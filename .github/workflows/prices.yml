@@ -14,6 +14,11 @@ on:
     - cron: "0 1 * * *"   # 03:00 Berlin while CEST (UTC+2)
     - cron: "0 2 * * *"   # 03:00 Berlin while CET  (UTC+1)
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Republish even if Cardmarket's data has not changed (use after editing cardmarket_links.json or sweep.py)"
+        type: boolean
+        default: false
 
 concurrency:
   group: prices
@@ -39,11 +44,16 @@ jobs:
 
       # No API key and no quota: the three Cardmarket Data Tables exports are public static
       # files. The RapidAPI subscription this pipeline used to depend on is no longer involved.
+      #
+      # 🪤 The unchanged-data check keys on CARDMARKET's stamp, so it cannot see that OUR inputs
+      # changed. After editing cardmarket_links.json, sweep.py or rune_pid_overrides.json the run
+      # would no-op for the rest of the day and the fix would sit unpublished — which is exactly
+      # what happened on 2026-07-31. Tick `force` on a manual run to override it.
       - name: Build the snapshot
         id: sweep
         run: |
           set +e
-          python sweep.py --assets . --out out/prices.json
+          python sweep.py --assets . --out out/prices.json ${{ inputs.force && '--force' || '' }}
           code=$?
           set -e
           if [ $code -eq 0 ]; then
