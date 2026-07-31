@@ -98,6 +98,36 @@ def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
 
+def squash(s: str) -> str:
+    """Name key with every separator removed, not turned into a space.
+
+    🪤 [norm] turns an apostrophe into a SPACE, so Cardmarket's "Mel, Soul's Reflection" becomes
+    'mel soul s reflection' while its own slug Mel-Souls-Reflection becomes 'mel souls reflection'
+    — the same card, two keys, and VEN-151/195 went unpriced for it. Dropping separators rather
+    than spacing them makes both 'melsoulsreflection'. Used only as a fallback, after norm.
+    """
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+# 🪤 Ascending idProduct does NOT always track V1 -> V2. Cardmarket created every SFD/UNL rune's
+# SHOWCASE product days BEFORE its common one, so the group order is reversed for those twelve
+# cards and the version in the slug indexes the wrong half. Swain, Visionary 173 is here for a
+# different reason: Cardmarket left its second product un-versioned (bare slug), so there is no
+# -V2 for the link to carry and it would read as V1 forever.
+#
+# Verified card by card against the product pages on 2026-07-31. Checked and NOT needed anywhere
+# else: all 79 versioned Vendetta products and UNL Baron Nashor V1/V2/V3 order correctly by id.
+# Regenerate with the riftbound app repo's scratchpad/cardmarket_variant_links.py notes.
+def load_overrides(assets: str) -> dict:
+    path = os.path.join(assets, "rune_pid_overrides.json")
+    try:
+        return json.load(open(path, encoding="utf-8"))
+    except FileNotFoundError:
+        print("no rune_pid_overrides.json — 25 printings will take the wrong product's price",
+              file=sys.stderr)
+        return {}
+
+
 def app_name_variants(name: str):
     """Names to try for one app card, most specific first.
 
@@ -124,9 +154,13 @@ def price_of(row: dict | None):
     return None, None
 
 
-def build(singles: list, guide: dict, cards: list, links: dict) -> tuple[dict, dict]:
-    # (normalised name, set code) -> [idProduct...] ascending; ascending id tracks V1 -> V2 -> V3.
+def build(singles: list, guide: dict, cards: list, links: dict,
+          overrides: dict | None = None) -> tuple[dict, dict]:
+    overrides = overrides or {}
+    # (normalised name, set code) -> [idProduct...] ascending; ascending id tracks V1 -> V2 -> V3,
+    # EXCEPT where `overrides` says otherwise — see its note.
     groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+    squashed: dict[tuple[str, str], list[int]] = defaultdict(list)
     unknown_expansions: dict[int, int] = defaultdict(int)
     for p in singles:
         code = EXPANSION.get(p["idExpansion"])
@@ -134,7 +168,10 @@ def build(singles: list, guide: dict, cards: list, links: dict) -> tuple[dict, d
             unknown_expansions[p["idExpansion"]] += 1
             continue
         groups[(norm(p["name"]), code)].append(p["idProduct"])
+        squashed[(squash(p["name"]), code)].append(p["idProduct"])
     for v in groups.values():
+        v.sort()
+    for v in squashed.values():
         v.sort()
 
     out: dict[str, dict] = {}
@@ -146,6 +183,24 @@ def build(singles: list, guide: dict, cards: list, links: dict) -> tuple[dict, d
         code, number, name = c["set"], c["number"], c["name"]
         per_set[code][0] += 1
         key = f"{code}-{number}"
+
+        # A printing whose product the group order cannot express. Pinned, never guessed.
+        forced = overrides.get(f"{name}|{code}|{number}")
+        if forced is not None:
+            value, field = price_of(guide.get(forced))
+            if value is None:
+                stats["matched but unpriced"] += 1
+                continue
+            entry = {"low": round(value, 2), "src": field, "pid": forced}
+            g = guide.get(forced) or {}
+            foil = g.get("trend-foil") or g.get("low-foil")
+            if isinstance(foil, (int, float)) and not isinstance(foil, bool) and foil > 0 \
+                    and abs(foil - value) > 0.005:
+                entry["foil"] = round(float(foil), 2)
+            out[key] = entry
+            stats[f"priced via override ({field})"] += 1
+            per_set[code][1] += 1
+            continue
 
         # The app's own Cardmarket link, when it has one, names the exact variant.
         url = links.get(f"{name}|{code}|{number}")
@@ -159,10 +214,17 @@ def build(singles: list, guide: dict, cards: list, links: dict) -> tuple[dict, d
                 slug_name = norm((slug[:vm.start()] if vm else slug).replace("-", " "))
 
         group = None
-        for candidate in ([slug_name] if slug_name else []) + list(app_name_variants(name)):
+        candidates = ([slug_name] if slug_name else []) + list(app_name_variants(name))
+        for candidate in candidates:
             group = groups.get((candidate, code))
             if group:
                 break
+        if not group:
+            # Separator-insensitive second pass: catches the apostrophe cases norm() splits.
+            for candidate in candidates:
+                group = squashed.get((squash(candidate), code))
+                if group:
+                    break
 
         if not group:
             stats["no product for this name"] += 1
@@ -294,7 +356,7 @@ def main() -> None:
     links = json.load(open(os.path.join(args.assets, "cardmarket_links.json"), encoding="utf-8"))
 
     guide = {p["idProduct"]: p for p in guide_doc["priceGuides"]}
-    built, _ = build(singles_doc["products"], guide, cards, links)
+    built, _ = build(singles_doc["products"], guide, cards, links, load_overrides(args.assets))
 
     now = datetime.now(timezone.utc)
     live = len(built)
